@@ -905,12 +905,18 @@ function ensureAudio() {
     masterNode = comp;
     comp.connect(audioCtx.destination);
 
+    const tone = audioCtx.createBiquadFilter();
+    tone.type = "lowpass";
+    tone.frequency.value = 2600;
+    tone.Q.value = 0.55;
+    tone.connect(masterNode);
+
     dryBus = audioCtx.createGain();
-    dryBus.gain.value = 0.9;
+    dryBus.gain.value = 0.86;
     wetBus = audioCtx.createGain();
-    wetBus.gain.value = 0.55;
-    dryBus.connect(masterNode);
-    wetBus.connect(masterNode);
+    wetBus.gain.value = 0.38;
+    dryBus.connect(tone);
+    wetBus.connect(tone);
 
     bodyConvolver = audioCtx.createConvolver();
     bodyConvolver.buffer = makeBodyIR(audioCtx);
@@ -932,9 +938,8 @@ function makeBodyIR(ctx) {
   const len = Math.floor(sr * 0.85);
   const buf = ctx.createBuffer(2, len, sr);
   const modes = [
-    [88, 0.45, 0.9], [116, 0.35, 0.7], [148, 0.28, 0.6], [198, 0.22, 0.55],
-    [256, 0.18, 0.45], [342, 0.15, 0.38], [455, 0.12, 0.30], [620, 0.10, 0.23],
-    [815, 0.08, 0.18], [1080, 0.065, 0.14], [1420, 0.05, 0.11], [1900, 0.04, 0.08]
+    [82, 0.42, 0.75], [108, 0.34, 0.62], [146, 0.26, 0.50], [188, 0.20, 0.40],
+    [246, 0.16, 0.31], [322, 0.13, 0.22], [420, 0.10, 0.14], [530, 0.07, 0.08]
   ];
   for (let ch = 0; ch < 2; ch++) {
     const d = buf.getChannelData(ch);
@@ -948,7 +953,7 @@ function makeBodyIR(ctx) {
       }
       // Short attack smudge, not a click.
       v += (Math.random() * 2 - 1) * Math.exp(-t / 0.025) * 0.06;
-      d[i] = v * 0.075;
+      d[i] = v * 0.055;
     }
   }
   return buf;
@@ -960,7 +965,7 @@ function stringFreq(str, fret) { return OPEN_FREQS[str] * Math.pow(2, fret / 12)
 function pluck(freq, when, vol, pan) {
   const ctx = ensureAudio();
   const sr = ctx.sampleRate;
-  const dur = 2.5;
+  const dur = 2.1;
   const N = Math.max(4, Math.round(sr / freq));
 
   // Karplus-Strong string waveguide.
@@ -973,24 +978,24 @@ function pluck(freq, when, vol, pan) {
   delay.delayTime.value = N / sr;
   const loopFilter = ctx.createBiquadFilter();
   loopFilter.type = "lowpass";
-  loopFilter.frequency.value = Math.max(1200, Math.min(5400, freq * 11));
-  loopFilter.Q.value = 0.3;
+  loopFilter.frequency.value = Math.max(760, Math.min(2200, freq * 8));
+  loopFilter.Q.value = 0.55;
   const feedback = ctx.createGain();
-  feedback.gain.value = 0.98;
+  feedback.gain.value = 0.94;
 
   // Body / pick transient layered with the string gives acoustic attack.
   const pick = ctx.createBufferSource();
   pick.buffer = noiseBuffer;
   const pickFilter = ctx.createBiquadFilter();
   pickFilter.type = "bandpass";
-  pickFilter.frequency.value = Math.min(5200, Math.max(900, freq * 7));
-  pickFilter.Q.value = 0.7;
+  pickFilter.frequency.value = Math.min(1900, Math.max(620, freq * 4));
+  pickFilter.Q.value = 0.9;
   const pickGain = ctx.createGain();
-  pickGain.gain.value = 0.055;
+  pickGain.gain.value = 0.018;
 
   const env = ctx.createGain();
   env.gain.setValueAtTime(0.0001, when);
-  env.gain.exponentialRampToValueAtTime(vol, when + 0.007);
+  env.gain.exponentialRampToValueAtTime(vol, when + 0.014);
   env.gain.exponentialRampToValueAtTime(0.0001, when + dur);
 
   const dc = ctx.createBiquadFilter();
@@ -1029,16 +1034,16 @@ function strumChordAt(shape, when) {
   const freqs = [];
   shape.split("").forEach((c, i) => { if (c !== "x") freqs.push(stringFreq(i, parseInt(c, 10))); });
   const n = freqs.length;
-  freqs.forEach((f, k) => pluck(f, when + k * 0.05, 0.24, n > 1 ? -0.42 + (k / (n - 1)) * 0.84 : 0));
+  freqs.forEach((f, k) => pluck(f, when + k * 0.055, 0.16, n > 1 ? -0.42 + (k / (n - 1)) * 0.84 : 0));
 }
 function strumChord(shape) { strumChordAt(shape, ensureAudio().currentTime); }
 function playScale(scale) {
   const ctx = ensureAudio();
   const now = ctx.currentTime;
   const freqs = scale.notes.map(n => stringFreq(n[0], n[1])).sort((a, b) => a - b);
-  freqs.forEach((f, k) => pluck(f, now + k * 0.16, 0.26, k % 2 ? 0.2 : -0.2));
+  freqs.forEach((f, k) => pluck(f, now + k * 0.17, 0.18, k % 2 ? 0.2 : -0.2));
 }
-function playOpenString(str) { pluck(OPEN_FREQS[str], ensureAudio().currentTime, 0.3, 0); }
+function playOpenString(str) { pluck(OPEN_FREQS[str], ensureAudio().currentTime, 0.21, 0); }
 function playProgression(names) {
   const ctx = ensureAudio();
   const shapes = {};
