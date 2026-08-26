@@ -885,22 +885,36 @@ function renderChord(shape) {
   return `<svg viewBox="0 0 ${W} ${height}" xmlns="http://www.w3.org/2000/svg">${fretsMark}${stringsMark}${marks}</svg>`;
 }
 
-/* ---------- Guitar audio (warm modal plucked-string synthesis) ---------- */
+/* ---------- Guitar audio (acoustic string + body resonance) ---------- */
 let audioCtx = null;
 let masterNode = null;
 let noiseBuffer = null;
+let dryBus = null;
+let wetBus = null;
+let bodyConvolver = null;
 
 function ensureAudio() {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const comp = audioCtx.createDynamicsCompressor();
     comp.threshold.value = -18;
-    comp.knee.value = 18;
+    comp.knee.value = 16;
     comp.ratio.value = 4;
     comp.attack.value = 0.004;
     comp.release.value = 0.2;
-    comp.connect(audioCtx.destination);
     masterNode = comp;
+    comp.connect(audioCtx.destination);
+
+    dryBus = audioCtx.createGain();
+    dryBus.gain.value = 0.9;
+    wetBus = audioCtx.createGain();
+    wetBus.gain.value = 0.55;
+    dryBus.connect(masterNode);
+    wetBus.connect(masterNode);
+
+    bodyConvolver = audioCtx.createConvolver();
+    bodyConvolver.buffer = makeBodyIR(audioCtx);
+    bodyConvolver.connect(wetBus);
 
     const sr = audioCtx.sampleRate;
     noiseBuffer = audioCtx.createBuffer(1, Math.floor(sr * 0.06), sr);
@@ -911,72 +925,120 @@ function ensureAudio() {
   return audioCtx;
 }
 
+// A synthetic wooden-body impulse response gives the note air, warmth and a
+// natural room resonance that plain sine partials cannot produce.
+function makeBodyIR(ctx) {
+  const sr = ctx.sampleRate;
+  const len = Math.floor(sr * 0.85);
+  const buf = ctx.createBuffer(2, len, sr);
+  const modes = [
+    [88, 0.45, 0.9], [116, 0.35, 0.7], [148, 0.28, 0.6], [198, 0.22, 0.55],
+    [256, 0.18, 0.45], [342, 0.15, 0.38], [455, 0.12, 0.30], [620, 0.10, 0.23],
+    [815, 0.08, 0.18], [1080, 0.065, 0.14], [1420, 0.05, 0.11], [1900, 0.04, 0.08]
+  ];
+  for (let ch = 0; ch < 2; ch++) {
+    const d = buf.getChannelData(ch);
+    const phase = ch * 0.7 + Math.random() * 0.5;
+    for (let i = 0; i < len; i++) {
+      const t = i / sr;
+      let v = 0;
+      for (let m = 0; m < modes.length; m++) {
+        const [f, decay, amp] = modes[m];
+        v += Math.sin(2 * Math.PI * f * t + phase * (m + 1)) * Math.exp(-t / decay) * amp;
+      }
+      // Short attack smudge, not a click.
+      v += (Math.random() * 2 - 1) * Math.exp(-t / 0.025) * 0.06;
+      d[i] = v * 0.075;
+    }
+  }
+  return buf;
+}
+
 const OPEN_FREQS = [82.41, 110.00, 146.83, 196.00, 246.94, 329.63]; // 低音E -> 高音e
 function stringFreq(str, fret) { return OPEN_FREQS[str] * Math.pow(2, fret / 12); }
 
-function pluck(freq, when, vol) {
+function pluck(freq, when, vol, pan) {
   const ctx = ensureAudio();
-  const dur = 2.3;
-  const g = ctx.createGain();
-  g.gain.setValueAtTime(0.0001, when);
-  g.gain.exponentialRampToValueAtTime(vol, when + 0.006);
-  g.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+  const sr = ctx.sampleRate;
+  const dur = 2.5;
+  const N = Math.max(4, Math.round(sr / freq));
 
-  const tone = ctx.createBiquadFilter();
-  tone.type = "lowpass";
-  tone.frequency.value = Math.min(8200, Math.max(2200, freq * 9));
-  tone.Q.value = 0.45;
+  // Karplus-Strong string waveguide.
+  const buf = ctx.createBuffer(1, N, sr);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < N; i++) d[i] = Math.random() * 2 - 1;
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  const delay = ctx.createDelay(1);
+  delay.delayTime.value = N / sr;
+  const loopFilter = ctx.createBiquadFilter();
+  loopFilter.type = "lowpass";
+  loopFilter.frequency.value = Math.max(1200, Math.min(5400, freq * 11));
+  loopFilter.Q.value = 0.3;
+  const feedback = ctx.createGain();
+  feedback.gain.value = 0.98;
 
-  // Modal partials: mimic a real guitar string, with slight inharmonicity.
-  const amps = [1.00, 0.52, 0.34, 0.21, 0.13, 0.085, 0.055, 0.034];
-  amps.forEach((amp, i) => {
-    const n = i + 1;
-    const partialFreq = freq * n * (1 + 0.000045 * n * n);
-    const osc = ctx.createOscillator();
-    osc.type = "sine";
-    osc.frequency.value = partialFreq;
-    osc.detune.value = (Math.random() * 2 - 1) * 1.4;
-    const pg = ctx.createGain();
-    pg.gain.value = amp;
-    osc.connect(pg);
-    pg.connect(g);
-    osc.start(when);
-    osc.stop(when + dur + 0.05);
-  });
+  // Body / pick transient layered with the string gives acoustic attack.
+  const pick = ctx.createBufferSource();
+  pick.buffer = noiseBuffer;
+  const pickFilter = ctx.createBiquadFilter();
+  pickFilter.type = "bandpass";
+  pickFilter.frequency.value = Math.min(5200, Math.max(900, freq * 7));
+  pickFilter.Q.value = 0.7;
+  const pickGain = ctx.createGain();
+  pickGain.gain.value = 0.055;
 
-  // Short, filtered pick transient gives it a natural attack without harshness.
-  const noise = ctx.createBufferSource();
-  noise.buffer = noiseBuffer;
-  const bp = ctx.createBiquadFilter();
-  bp.type = "bandpass";
-  bp.frequency.value = Math.min(5200, freq * 8);
-  bp.Q.value = 0.65;
-  const ng = ctx.createGain();
-  ng.gain.setValueAtTime(0.07 * vol, when);
-  ng.gain.exponentialRampToValueAtTime(0.0001, when + 0.045);
-  noise.connect(bp);
-  bp.connect(ng);
-  ng.connect(g);
-  noise.start(when);
-  noise.stop(when + 0.06);
+  const env = ctx.createGain();
+  env.gain.setValueAtTime(0.0001, when);
+  env.gain.exponentialRampToValueAtTime(vol, when + 0.007);
+  env.gain.exponentialRampToValueAtTime(0.0001, when + dur);
 
-  g.connect(tone);
-  tone.connect(masterNode);
+  const dc = ctx.createBiquadFilter();
+  dc.type = "highpass";
+  dc.frequency.value = 55;
+  dc.Q.value = 0.6;
+
+  src.connect(delay);
+  delay.connect(loopFilter);
+  loopFilter.connect(feedback);
+  feedback.connect(delay);
+  delay.connect(env);
+
+  pick.connect(pickFilter);
+  pickFilter.connect(pickGain);
+  pickGain.connect(env);
+
+  let output = dc;
+  env.connect(dc);
+  if (pan !== undefined) {
+    const panner = ctx.createStereoPanner();
+    panner.pan.value = Math.max(-0.75, Math.min(0.75, pan));
+    dc.connect(panner);
+    output = panner;
+  }
+  output.connect(dryBus);
+  output.connect(bodyConvolver);
+
+  src.start(when);
+  src.stop(when + dur + 0.05);
+  pick.start(when);
+  pick.stop(when + 0.065);
 }
 
 function strumChordAt(shape, when) {
   const freqs = [];
   shape.split("").forEach((c, i) => { if (c !== "x") freqs.push(stringFreq(i, parseInt(c, 10))); });
-  freqs.forEach((f, k) => pluck(f, when + k * 0.048, 0.26));
+  const n = freqs.length;
+  freqs.forEach((f, k) => pluck(f, when + k * 0.05, 0.24, n > 1 ? -0.42 + (k / (n - 1)) * 0.84 : 0));
 }
 function strumChord(shape) { strumChordAt(shape, ensureAudio().currentTime); }
 function playScale(scale) {
   const ctx = ensureAudio();
   const now = ctx.currentTime;
   const freqs = scale.notes.map(n => stringFreq(n[0], n[1])).sort((a, b) => a - b);
-  freqs.forEach((f, k) => pluck(f, now + k * 0.16, 0.28));
+  freqs.forEach((f, k) => pluck(f, now + k * 0.16, 0.26, k % 2 ? 0.2 : -0.2));
 }
-function playOpenString(str) { pluck(OPEN_FREQS[str], ensureAudio().currentTime, 0.34); }
+function playOpenString(str) { pluck(OPEN_FREQS[str], ensureAudio().currentTime, 0.3, 0); }
 function playProgression(names) {
   const ctx = ensureAudio();
   const shapes = {};
