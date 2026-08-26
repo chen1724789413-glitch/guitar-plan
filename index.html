@@ -964,57 +964,66 @@ function stringFreq(str, fret) { return OPEN_FREQS[str] * Math.pow(2, fret / 12)
 
 function pluck(freq, when, vol, pan) {
   const ctx = ensureAudio();
-  const sr = ctx.sampleRate;
-  const dur = 2.1;
-  const N = Math.max(4, Math.round(sr / freq));
+  const dur = 2.4;
+  const attack = 0.009;
 
-  // Karplus-Strong string waveguide.
-  const buf = ctx.createBuffer(1, N, sr);
-  const d = buf.getChannelData(0);
-  for (let i = 0; i < N; i++) d[i] = Math.random() * 2 - 1;
-  const src = ctx.createBufferSource();
-  src.buffer = buf;
-  const delay = ctx.createDelay(1);
-  delay.delayTime.value = N / sr;
-  const loopFilter = ctx.createBiquadFilter();
-  loopFilter.type = "lowpass";
-  loopFilter.frequency.value = Math.max(760, Math.min(2200, freq * 8));
-  loopFilter.Q.value = 0.55;
-  const feedback = ctx.createGain();
-  feedback.gain.value = 0.94;
-
-  // Body / pick transient layered with the string gives acoustic attack.
-  const pick = ctx.createBufferSource();
-  pick.buffer = noiseBuffer;
-  const pickFilter = ctx.createBiquadFilter();
-  pickFilter.type = "bandpass";
-  pickFilter.frequency.value = Math.min(1900, Math.max(620, freq * 4));
-  pickFilter.Q.value = 0.9;
-  const pickGain = ctx.createGain();
-  pickGain.gain.value = 0.018;
-
-  const env = ctx.createGain();
-  env.gain.setValueAtTime(0.0001, when);
-  env.gain.exponentialRampToValueAtTime(vol, when + 0.014);
-  env.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+  // Warm additive synthesis: each harmonic fades at its own rate, with high
+  // harmonics decaying much faster. This is the key acoustic-string behaviour
+  // that avoids both a sterile "electric" tone and a harsh noise burst.
+  const tone = ctx.createBiquadFilter();
+  tone.type = "lowpass";
+  tone.frequency.value = Math.max(1400, Math.min(3600, freq * 5));
+  tone.Q.value = 0.4;
 
   const dc = ctx.createBiquadFilter();
   dc.type = "highpass";
-  dc.frequency.value = 55;
+  dc.frequency.value = 60;
   dc.Q.value = 0.6;
 
-  src.connect(delay);
-  delay.connect(loopFilter);
-  loopFilter.connect(feedback);
-  feedback.connect(delay);
-  delay.connect(env);
+  const numPartials = 10;
+  for (let n = 1; n <= numPartials; n++) {
+    const inharm = 1 + 0.00018 * n * n;
+    const partialFreq = freq * n * inharm;
+    const amp = 0.22 * Math.pow(0.72, n - 1);
+    const decay = Math.max(0.06, dur * Math.pow(0.55, n - 1));
 
-  pick.connect(pickFilter);
-  pickFilter.connect(pickGain);
-  pickGain.connect(env);
+    const osc = ctx.createOscillator();
+    osc.type = "sine";
+    osc.frequency.value = partialFreq;
+
+    const pg = ctx.createGain();
+    pg.gain.setValueAtTime(0.0001, when);
+    pg.gain.exponentialRampToValueAtTime(amp, when + attack);
+    pg.gain.exponentialRampToValueAtTime(0.0001, when + decay);
+
+    osc.connect(pg);
+    pg.connect(tone);
+    osc.start(when);
+    osc.stop(when + decay + 0.06);
+  }
+
+  // A barely audible, heavily low-passed pick transient adds realism without
+  // any of the metallic harshness of white noise.
+  const pick = ctx.createBufferSource();
+  pick.buffer = noiseBuffer;
+  const pickLP = ctx.createBiquadFilter();
+  pickLP.type = "lowpass";
+  pickLP.frequency.value = Math.min(1400, Math.max(420, freq * 2.2));
+  const pickGain = ctx.createGain();
+  pickGain.gain.setValueAtTime(0.012, when);
+  pickGain.gain.exponentialRampToValueAtTime(0.0001, when + 0.05);
+  pick.connect(pickLP);
+  pickLP.connect(pickGain);
+  pickGain.connect(tone);
+  pick.start(when);
+  pick.stop(when + 0.06);
+
+  const noteGain = ctx.createGain();
+  noteGain.gain.value = vol;
+  tone.connect(noteGain);
+  noteGain.connect(dc);
 
   let output = dc;
-  env.connect(dc);
   if (pan !== undefined) {
     const panner = ctx.createStereoPanner();
     panner.pan.value = Math.max(-0.75, Math.min(0.75, pan));
@@ -1023,11 +1032,6 @@ function pluck(freq, when, vol, pan) {
   }
   output.connect(dryBus);
   output.connect(bodyConvolver);
-
-  src.start(when);
-  src.stop(when + dur + 0.05);
-  pick.start(when);
-  pick.stop(when + 0.065);
 }
 
 function strumChordAt(shape, when) {
